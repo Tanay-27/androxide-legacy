@@ -43,6 +43,7 @@ from collections import Counter, OrderedDict
 from typing import Iterator
 
 import androguard_rs
+from androguard_rs import _arscconfig
 from androguard_rs import dex as _dex
 
 __all__ = ["analyze_apk", "Analysis", "ARSCParser", "GAPS", "NOTES"]
@@ -81,7 +82,7 @@ def _full_key(key, cls: str):
 #: from an AnalyzeAPK result), by this module's class name. An attribute
 #: androguard has that isn't implemented here is a gap (NotImplementedError,
 #: counted in GAPS); one androguard doesn't have either is an AttributeError,
-#: as androguard raises (callers may catch it).
+#: as androguard raises (callers probing attributes catch it).
 _AG_ATTRS = {
     'Analysis': frozenset([
         '_Analysis__created_xrefs', '_Analysis__method_hashes', '_create_xref', '_resolve_method', 'add',
@@ -828,7 +829,7 @@ class Analysis(_Loud):
                 return hit
         data = self._rs.instructions(key)
         insns = _dex._instructions(data) if data is not None else []
-        hit = (insns, [r[0] for r in data[1]] if data is not None else [])
+        hit = (insns, data[2] if data is not None else [])
         with self._lock:
             hit = self._lru.setdefault(key, hit)
             self._lru.move_to_end(key)
@@ -862,8 +863,8 @@ class Analysis(_Loud):
         # get_methods() whose method's get_name(), get_descriptor() and
         # get_access_flags_string() ("" for an ExternalMethod, which
         # no_external leaves out) re.match() the other three. The patterns
-        # are used with Python's re as given (unescaped class names,
-        # lookaheads, space-separated descriptors all work as in androguard). Matching
+        # are used with Python's re as given (callers pass unescaped
+        # class names, lookaheads, space-separated descriptors). Matching
         # runs on the class_methods() rows; a MethodAnalysis is made only
         # for a match.
         for cname, ext in self._entries():
@@ -924,7 +925,7 @@ class ARSCParser(_Loud):
     def get_resolved_res_configs(self, rid, config=None):
         if config is not None:
             _gap("ARSCParser", "get_resolved_res_configs(config=...)")
-        return self._r.get_resolved_res_configs(rid)
+        return self._r.get_resolved_res_configs(rid, _arscconfig.from_bytes)
 
     def get_resource_xml_name(self, r_id, package=None):
         return self._r.get_resource_xml_name(r_id, package)

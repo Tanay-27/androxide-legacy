@@ -1,14 +1,12 @@
 //! Per-DEX views for `androguard_rs.dex.DEX`: what androguard 4.1.3's DEX
 //! objects (`ClassDefItem`, `EncodedMethod`, `EncodedField`) hold, read
-//! from one class_def at a time, and the TLS-related method pre-filter
-//! (`ssl_candidates`, not androguard).
+//! from one class_def at a time.
 
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 
 use crate::classes::{Value, class_info, field_flags, method_flags};
 use crate::dex::{Dex, Member};
-use crate::insn::{Decoder, Ref};
 use crate::render::AgResolver;
 
 /// An EncodedMethod as androguard has it after `load()`.
@@ -127,83 +125,6 @@ pub fn class_names(dex: &Dex) -> Vec<String> {
     (0..dex.class_count())
         .map(|ci| dex.class_def(ci).map(|cd| r.type_name(cd.class_idx)).unwrap_or_default())
         .collect()
-}
-
-/// Names of the methods that implement TLS trust/hostname checks
-/// (`X509TrustManager`, `HostnameVerifier`, `WebViewClient`).
-const SSL_NAMES: [&str; 3] = ["checkServerTrusted", "verify", "onReceivedSslError"];
-/// `new-instance` of the accept-everything hostname verifier: type suffix.
-const ALLOW_ALL: &str = "Lorg/apache/http/conn/ssl/AllowAllHostnameVerifier;";
-/// `sget-object` of the same verifier's static instance: field substring.
-const ALLOW_ALL_FIELD: &str = "Lorg/apache/http/conn/ssl/SSLSocketFactory;->ALLOW_ALL_HOSTNAME_VERIFIER";
-/// `invoke-static` of the no-validation socket factory: method suffix.
-const GET_INSECURE: &str =
-    "Landroid/net/SSLCertificateSocketFactory;->getInsecure(I Landroid/net/SSLSessionCache;)Ljavax/net/ssl/SSLSocketFactory;";
-
-/// Whether a method may implement or weaken TLS validation: its name is
-/// one of `SSL_NAMES`, or its code has an instruction whose `get_output()`
-/// matches one of the markers above (each output is the register list,
-/// ", ", then the referenced item's text, and no marker contains ", ", so
-/// matching the item's text is the same), or its code can't be read or
-/// disassembled. Meant as a cheap superset for a caller that runs its own,
-/// slower per-method checks on what this selects.
-fn ssl_candidate(dex: &Dex, r: &AgResolver, midx: u32, code_off: u32) -> bool {
-    if let Ok((_, _, name_idx)) = dex.method_id(midx) {
-        let name = r.string(name_idx);
-        if SSL_NAMES.contains(&name.as_str()) {
-            return true;
-        }
-    }
-    if !dex.has_code_item(code_off) {
-        return false;
-    }
-    let Ok(code) = dex.code(code_off) else { return true };
-    let mut dec = Decoder::new(code);
-    let mut hit = false;
-    for ins in &mut dec {
-        if ins.payload != 0 {
-            continue;
-        }
-        hit = match (ins.op, ins.kind) {
-            (0x22, Ref::Type) => r.type_name(ins.idx).ends_with(ALLOW_ALL),
-            (0x62, Ref::Field) => r.field(ins.idx).contains(ALLOW_ALL_FIELD),
-            (0x71, Ref::Method) => r.method(ins.idx).ends_with(GET_INSECURE),
-            _ => false,
-        };
-        if hit {
-            break;
-        }
-    }
-    hit || dec.invalid || dec.truncated
-}
-
-/// (class_def index, position in its class_data) of each EncodedMethod of
-/// `get_encoded_methods()` (every class_def in order, each class_data's
-/// direct then virtual methods, a shared class_data once per class_def
-/// using it) that `ssl_candidate` selects.
-pub fn ssl_candidates(dex: &Dex) -> Vec<(u32, u32)> {
-    let r = AgResolver { dex };
-    let mut per_data: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    let mut out = Vec::new();
-    for ci in 0..dex.class_count() {
-        let Ok(cd) = dex.class_def(ci) else { continue };
-        if !dex.has_class_data(cd.class_data_off) {
-            continue;
-        }
-        let hits = per_data.entry(cd.class_data_off).or_insert_with(|| match dex.class_data(cd.class_data_off) {
-            Ok(data) => data
-                .direct_methods
-                .iter()
-                .chain(&data.virtual_methods)
-                .enumerate()
-                .filter(|(_, m)| ssl_candidate(dex, &r, m.idx, m.code_off))
-                .map(|(pos, _)| pos as u32)
-                .collect(),
-            Err(_) => Vec::new(),
-        });
-        out.extend(hits.iter().map(|&pos| (ci as u32, pos)));
-    }
-    out
 }
 
 /// See `Apk.dex_find_member`.

@@ -2,8 +2,7 @@
 views from AnalyzeAPK, a manual DEX()/Analysis.add() load and the facade,
 and, on each of PARITY_APKS, apk_views() (every class, method and field of
 every DEX object; find_methods, xref callers, get_vm_class(), MethodAnalysis
-repr()s), with get_ssl_candidate_methods() checked against the reference
-definition over androguard's own objects."""
+repr()s, and a per-method instruction walk over get_encoded_methods())."""
 
 import logging
 import os
@@ -74,5 +73,3 @@ def test_apk(path):
     got = K.apk_views(*manual(APK, DEX, Analysis, raw))
     for key in expected:
         assert got[key] == expected[key], key
-    d = AnalyzeAPK(raw, raw=True)[1]
-    assert K.native_tls_candidates(d) == expected["tls_candidates"]

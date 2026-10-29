@@ -10,7 +10,7 @@ code objects return them with androguard 4.1.3's exact values.
 
 ```python
 # from androguard.core.dex import Instruction, Instruction11n, Instruction21h, Instruction21s, Instruction31i, Instruction35c
-from androguard_rs.dex import Instruction, Instruction11n, Instruction21h, Instruction21s, Instruction31i, Instruction35c
+from androguard_rs.core.dex import Instruction, Instruction11n, Instruction21h, Instruction21s, Instruction31i, Instruction35c
 ```
 
 `isinstance` checks then hold for the objects the facade returns. Every

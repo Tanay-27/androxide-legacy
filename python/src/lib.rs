@@ -10,7 +10,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use androguard_core::apk::{HeaderMode, Loaded, SkippedDex, load_bytes_mode, load_mode};
+use androguard_core::apk::{HeaderMode, Loaded, SkippedDex, load_bytes_mode_depth, load_mode_depth};
 use androguard_core::classes::{Value, class_info};
 use androguard_core::dexview;
 use androguard_core::index::{Hit, HitKey, Index, Resolved, sig_hash};
@@ -69,6 +69,8 @@ struct Apk {
     names: Vec<String>,
     /// Position in `names` of each loaded DEX.
     positions: Vec<usize>,
+    /// What androguard's AnalyzeAPK raises (under `header_errors=True`).
+    load_error: Option<androguard_core::agload::AgErr>,
 }
 
 #[pymethods]
@@ -78,7 +80,8 @@ impl Apk {
     ///
     /// With `tolerant=True`, a DEX that androguard's `DEX()` rejects with
     /// "Not a DEX file, Header too small." or "This is not a DEX file! Wrong
-    /// endian tag: ..." is left out (see `skipped_dex()`);
+    /// endian tag: ..." is left out (see `skipped_dex()`), as callers that
+    /// catch `DEX()`'s ValueError and skip that DEX see it;
     /// otherwise it fails the APK, as `AnalyzeAPK` does.
     ///
     /// With `header_errors=True`, every check androguard's `DEX()` header
@@ -86,13 +89,13 @@ impl Apk {
     /// and a DEX failing one is left out and listed by `header_errors()`, so
     /// the caller can raise what androguard raises, in its order.
     #[new]
-    #[pyo3(signature = (path, tolerant = false, header_errors = false))]
-    fn new(py: Python<'_>, path: &str, tolerant: bool, header_errors: bool) -> PyResult<Self> {
+    #[pyo3(signature = (path, tolerant = false, header_errors = false, max_depth = androguard_core::apk::DEFAULT_MAX_DEPTH, c_budget = androguard_core::apk::DEFAULT_C_BUDGET))]
+    fn new(py: Python<'_>, path: &str, tolerant: bool, header_errors: bool, max_depth: i64, c_budget: i64) -> PyResult<Self> {
         let path = path.to_owned();
         let mode = header_mode(tolerant, header_errors);
         let (idx, l) = py
             .detach(move || -> anyhow::Result<(Index, Loaded)> {
-                let mut l = load_mode(&path, mode)?;
+                let mut l = load_mode_depth(&path, mode, (max_depth, c_budget))?;
                 Ok((Index::build(std::mem::take(&mut l.dexes))?, l))
             })
             .map_err(err)?;
@@ -101,19 +104,19 @@ impl Apk {
 
     /// `Apk(path)` for an APK held in memory (`bytes` or `bytearray`).
     #[staticmethod]
-    #[pyo3(signature = (data, tolerant = false, header_errors = false))]
-    fn from_bytes(py: Python<'_>, data: pyo3::pybacked::PyBackedBytes, tolerant: bool, header_errors: bool) -> PyResult<Self> {
+    #[pyo3(signature = (data, tolerant = false, header_errors = false, max_depth = androguard_core::apk::DEFAULT_MAX_DEPTH, c_budget = androguard_core::apk::DEFAULT_C_BUDGET))]
+    fn from_bytes(py: Python<'_>, data: pyo3::pybacked::PyBackedBytes, tolerant: bool, header_errors: bool, max_depth: i64, c_budget: i64) -> PyResult<Self> {
         let mode = header_mode(tolerant, header_errors);
         let (idx, l) = py
             .detach(move || -> anyhow::Result<(Index, Loaded)> {
-                let mut l = load_bytes_mode(&data, mode)?;
+                let mut l = load_bytes_mode_depth(&data, mode, (max_depth, c_budget))?;
                 Ok((Index::build(std::mem::take(&mut l.dexes))?, l))
             })
             .map_err(err)?;
         Ok(Apk::with(idx, l))
     }
 
-    /// The index over DEX files given as bytes, in that order (the
+    /// The index over DEX files given as bytes, in that order (androguard's
     /// `DEX(bytes)` + `Analysis.add()` path). Each must pass androguard's
     /// header checks (the caller makes them, as `DEX()` does).
     #[staticmethod]
@@ -128,7 +131,7 @@ impl Apk {
                 drop(dexes);
                 let n = parsed.len();
                 let names = (0..n).map(|i| if i == 0 { "classes.dex".to_string() } else { format!("classes{}.dex", i + 1) }).collect();
-                Ok((Index::build(parsed)?, Loaded { names, dexes: Vec::new(), skipped: Vec::new(), positions: (0..n).collect() }))
+                Ok((Index::build(parsed)?, Loaded { names, dexes: Vec::new(), skipped: Vec::new(), positions: (0..n).collect(), load_error: None }))
             })
             .map_err(err)?;
         Ok(Apk::with(idx, l))
@@ -160,6 +163,13 @@ impl Apk {
     fn first_invalid<'py>(&self, py: Python<'py>) -> Option<(usize, usize, usize, Bound<'py, PyAny>)> {
         let (d, ci, pos, _, e) = py.detach(|| androguard_core::strict::first_invalid(&self.idx.dexes))?;
         Some((d, ci, pos, invalid_instruction(py, &e).into_value(py).into_bound(py).into_any()))
+    }
+
+    /// Under `header_errors=True`: what androguard 4.1.3's `AnalyzeAPK`
+    /// raises for this APK, as a recipe for `androguard_rs._agerr.make()`,
+    /// or None.
+    fn load_error<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        self.load_error.as_ref().map(|e| ag_err_py(py, e)).transpose()
     }
 
     /// Number of DEX files in the index.
@@ -323,17 +333,8 @@ impl Apk {
         Ok(out)
     }
 
-    /// TLS-related method pre-filter (not androguard): (class_def index,
-    /// position) of each EncodedMethod of DEX number `d`'s
-    /// `get_encoded_methods()` that it selects, in that order (see
-    /// `androguard_rs.dex.DEX.get_ssl_candidate_methods`).
-    fn ssl_candidates(&self, py: Python<'_>, d: usize) -> PyResult<Vec<(u32, u32)>> {
-        let dex = self.dex_at(d)?;
-        Ok(py.detach(|| dexview::ssl_candidates(dex)))
-    }
-
-    /// androguard's `APK.get_dex_names()`, i.e. the order AnalyzeAPK (and a
-    /// manual `DEX()` + `Analysis.add()` load) reads DEX files in: central directory order, names matching
+    /// androguard's `APK.get_dex_names()`, i.e. the order AnalyzeAPK (and
+    /// `get_all_dex()`) load DEX files in: central directory order, names matching
     /// `^classes(\d*).dex$`. Skipped ones included.
     fn dex_names(&self) -> Vec<String> {
         self.names.clone()
@@ -397,11 +398,12 @@ impl Apk {
 
     /// The method's instructions as androguard 4.1.3's
     /// `get_code().get_bc().get_instructions()` yields them, for the
-    /// `androguard_rs.dex` Instruction objects: `(insns, rows)`, where
+    /// `androguard_rs.dex` Instruction objects: `(insns, rows, offsets)`, where
     /// `insns` is the method's instruction bytes and each row is
     /// `(offset, get_op_value(), get_length(), len(get_raw()), get_output(),
     /// kind)`: `get_raw()` is `insns[offset:offset + raw_len]`, and `kind` is
-    /// the resolved reference (`get_translated_kind()`) or None. None if the
+    /// the resolved reference (`get_translated_kind()`) or None; `offsets`
+    /// is each row's offset. None if the
     /// method has no code here; InvalidInstruction exactly as `bytecode()`.
     /// Takes a signature or a row key, as `bytecode()`. Decoded on every
     /// call; nothing is kept.
@@ -848,7 +850,9 @@ fn rows_to_py<'py>(py: Python<'py>, dex: &androguard_core::dex::Dex, code: &[u8]
     let rows = androguard_core::insn_rows::insn_rows(dex, code).map_err(|e| invalid_instruction(py, &e))?;
     let none = py.None().into_bound(py);
     let out = PyList::empty(py);
+    let offs = PyList::empty(py);
     for r in rows {
+        offs.append(r.off)?;
         let output = match &r.output {
             Some(s) => py_str(py, s)?,
             None => none.clone(),
@@ -857,9 +861,56 @@ fn rows_to_py<'py>(py: Python<'py>, dex: &androguard_core::dex::Dex, code: &[u8]
             Some(s) => py_str(py, s)?,
             None => none.clone(),
         };
-        out.append((r.off, r.op_value, r.len, r.raw_len, output, kind))?;
+        let row = (r.off, r.op_value, r.len, r.raw_len, output, kind).into_pyobject(py)?;
+        untrack(&row);
+        out.append(row)?;
     }
-    PyTuple::new(py, [PyBytes::new(py, code).into_any(), out.into_any()])
+    PyTuple::new(py, [PyBytes::new(py, code).into_any(), out.into_any(), offs.into_any()])
+}
+
+/// Stop the cycle collector tracking `obj`: for objects that only refer to
+/// atomic values (ints, strings, bytes, None, tuples of those), which can't
+/// be part of a reference cycle. Instruction rows and objects are made by
+/// the million and dropped soon after; untracked, the collections their
+/// allocations trigger have nothing of theirs to traverse.
+fn untrack(obj: &Bound<'_, PyAny>) {
+    // SAFETY: `obj` is a live object (we hold a reference); the call is a
+    // no-op for an object that isn't tracked, and the object's own
+    // deallocator untracks only if it is still tracked.
+    unsafe { pyo3::ffi::PyObject_GC_UnTrack(obj.as_ptr().cast()) }
+}
+
+/// `androguard_rs.dex`'s Instruction objects for one `code_instructions()`
+/// / `instructions()` result: for each row, `object.__new__(classes[op])`
+/// with `_code = code` and `_row = row`, as the Python loop it replaces made
+/// them. Instructions (not the payloads, whose `notes` list callers fill)
+/// are untracked by the cycle collector, as their rows are: they refer only
+/// to the method's bytes and their row (and later the dict of their
+/// unpacked int fields).
+#[pyfunction]
+fn _instruction_objects<'py>(
+    py: Python<'py>,
+    code: &Bound<'py, PyAny>,
+    rows: &Bound<'py, PyList>,
+    classes: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyList>> {
+    let new = py.import(pyo3::intern!(py, "builtins"))?.getattr(pyo3::intern!(py, "object"))?.getattr(pyo3::intern!(py, "__new__"))?;
+    let k_code = pyo3::intern!(py, "_code");
+    let k_row = pyo3::intern!(py, "_row");
+    let out = PyList::empty(py);
+    for row in rows.iter() {
+        let op = row.cast::<PyTuple>()?.get_item(1)?;
+        let op_value: u32 = op.extract()?;
+        let cls = classes.get_item(&op)?.ok_or_else(|| PyValueError::new_err(format!("no instruction class for {op_value:#x}")))?;
+        let o = new.call1((cls,))?;
+        o.setattr(k_code, code)?;
+        o.setattr(k_row, &row)?;
+        if op_value < 0x100 {
+            untrack(&o);
+        }
+        out.append(o)?;
+    }
+    Ok(out)
 }
 
 fn header_mode(tolerant: bool, header_errors: bool) -> HeaderMode {
@@ -886,6 +937,7 @@ impl Apk {
             skipped: l.skipped,
             names: l.names,
             positions: l.positions,
+            load_error: l.load_error,
         }
     }
 
@@ -990,6 +1042,63 @@ fn _py_lower(s: &str) -> String {
     androguard_core::render::py_lower(s)
 }
 
+/// androguard 4.1.3's error for a DEX as a recipe tuple, which
+/// `androguard_rs._agerr.make()` turns into the exception.
+fn ag_err_py<'py>(py: Python<'py>, e: &androguard_core::agload::AgErr) -> PyResult<Bound<'py, PyTuple>> {
+    use androguard_core::agload::AgErr::*;
+    let t = |items: Vec<Bound<'py, PyAny>>| PyTuple::new(py, items);
+    let s = |v: &str| -> Bound<'py, PyAny> { PyString::new(py, v).into_any() };
+    let i = |v: u64| -> Bound<'py, PyAny> { v.into_pyobject(py).unwrap().into_any() };
+    match e {
+        Header { not_implemented, message } => {
+            t(vec![s("Header"), pyo3::types::PyBool::new(py, *not_implemented).to_owned().into_any(), s(message)])
+        }
+        Struct(n) => t(vec![s("Struct"), i(*n as u64)]),
+        KeyMap(ty) => t(vec![s("KeyMap"), i(*ty as u64)]),
+        KeyInt(v) => t(vec![s("KeyInt"), i(*v)]),
+        Enum { which, value } => t(vec![s("Enum"), s(which), i(*value)]),
+        IndexList => t(vec![s("IndexList")]),
+        IndexStr => t(vec![s("IndexStr")]),
+        Attr { obj, name } => t(vec![s("Attr"), s(obj), s(name)]),
+        Recursion => t(vec![s("Recursion")]),
+        NoTerminate => t(vec![s("NoTerminate")]),
+        Invalid(x) => t(vec![s("Invalid"), invalid_instruction(py, x).into_value(py).into_bound(py).into_any()]),
+    }
+}
+
+/// What androguard 4.1.3 raises for the DEX `data` in `DEX(data)`, then in
+/// `Analysis.add()`, then in `create_xref()`: three recipes or None (only
+/// the first that raises is given). `max_depth`: Python frames androguard
+/// may go deeper than `DEX.__init__`; `c_budget`: C recursion units left
+/// there. Raises ValueError if androguard loads
+/// the DEX but the native reader can't.
+#[pyfunction]
+#[pyo3(signature = (data, max_depth, c_budget = androguard_core::apk::DEFAULT_C_BUDGET))]
+fn _dex_check<'py>(py: Python<'py>, data: pyo3::pybacked::PyBackedBytes, max_depth: i64, c_budget: i64) -> PyResult<(Option<Bound<'py, PyTuple>>, Option<Bound<'py, PyTuple>>, Option<Bound<'py, PyTuple>>)> {
+    use androguard_core::agload;
+    let r = py
+        .detach(move || -> anyhow::Result<(Option<agload::AgErr>, Option<agload::AgErr>, Option<agload::AgErr>)> {
+            let st = match agload::load(&data, max_depth, c_budget) {
+                Ok(st) => st,
+                Err(e) => return Ok((Some(e), None, None)),
+            };
+            if st.no_map {
+                return Ok((None, Some(agload::add_error_no_map()), None));
+            }
+            let dex = androguard_core::dex::Dex::parse(data.to_vec())?;
+            if let Some(e) = agload::add_error(&st, &dex) {
+                return Ok((None, Some(e), None));
+            }
+            Ok((None, None, agload::xref_error(&st, &dex)))
+        })
+        .map_err(err)?;
+    Ok((
+        r.0.as_ref().map(|e| ag_err_py(py, e)).transpose()?,
+        r.1.as_ref().map(|e| ag_err_py(py, e)).transpose()?,
+        r.2.as_ref().map(|e| ag_err_py(py, e)).transpose()?,
+    ))
+}
+
 /// androguard 4.1.3's `DEX()` header checks on `data`: None, or
 /// ("ValueError" | "NotImplementedError", message) for the first that fails.
 #[pyfunction]
@@ -1025,9 +1134,11 @@ fn androguard_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("InvalidInstruction", m.py().get_type::<InvalidInstruction>())?;
     m.add_function(wrap_pyfunction!(_decode_dex_string, m)?)?;
     m.add_function(wrap_pyfunction!(_dex_header_error, m)?)?;
+    m.add_function(wrap_pyfunction!(_dex_check, m)?)?;
     m.add_function(wrap_pyfunction!(_dex_parse_check, m)?)?;
     m.add_function(wrap_pyfunction!(_dex_first_invalid, m)?)?;
     m.add_function(wrap_pyfunction!(_py_lower, m)?)?;
+    m.add_function(wrap_pyfunction!(_instruction_objects, m)?)?;
     m.add_class::<resources::Resources>()?;
     m.add("ResourcesError", m.py().get_type::<resources::ResourcesError>())?;
     m.add_function(wrap_pyfunction!(resources::_decode_pool_string, m)?)?;

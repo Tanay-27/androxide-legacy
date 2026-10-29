@@ -3,10 +3,10 @@ objects ``EncodedMethod.get_instructions()``, ``get_instruction()`` and
 ``get_code().get_bc().get_instructions()`` return in ``androguard_rs``'s
 facade (``androguard_rs._analysis``).
 
-Swap the import and ``isinstance`` checks keep working::
+Rename the import and ``isinstance`` checks keep working::
 
     # from androguard.core.dex import Instruction, Instruction11n, Instruction21s, Instruction31i
-    from androguard_rs.dex import Instruction, Instruction11n, Instruction21s, Instruction31i
+    from androguard_rs.core.dex import Instruction, Instruction11n, Instruction21s, Instruction31i
 
 Every class androguard 4.1.3 has for DEX bytecode is here under the same
 name, with the same public methods and the same format fields (``A``,
@@ -43,7 +43,10 @@ import struct
 from collections import Counter
 from enum import IntEnum
 
-from . import _native
+import sys as _sys
+
+from . import _agerr, _native
+from ._agerr import HiddenApiClassDataItem, TypeMapItem  # noqa: F401
 
 InvalidInstruction = _native.InvalidInstruction
 
@@ -132,7 +135,7 @@ class Instruction:
 
     def __getattr__(self, attr):
         if attr in self._FIELDS:
-            f = self._f
+            f = getattr(self, "_f", None)
             if f is None:
                 row = self._row
                 off = row[_OFF]
@@ -767,7 +770,7 @@ class _Payload:
 
     def __getattr__(self, attr):
         if attr in self._FIELDS:
-            f = self._f
+            f = getattr(self, "_f", None)
             if f is None:
                 row = self._row
                 off = row[_OFF]
@@ -1030,24 +1033,16 @@ _CLASSES.update({op: e[0] for op, e in DALVIK_OPCODES_PAYLOAD.items()})
 
 def _instructions(data) -> list:
     """Instruction objects for one `androguard_rs.Apk.instructions()` result
-    ``(insns, rows)``, in order."""
-    code, rows = data
-    classes = _CLASSES
-    new = object.__new__
-    out = []
-    append = out.append
-    for row in rows:
-        o = new(classes[row[1]])
-        o._code = code
-        o._row = row
-        o._f = None
-        append(o)
-    return out
+    ``(insns, rows, offsets)``, in order: ``object.__new__(cls)`` with
+    ``_code`` and ``_row`` set, built natively (``_f``, the unpacked format
+    fields, is set when first asked for)."""
+    return _native._instruction_objects(data[0], data[1], _CLASSES)
 
 
 # ── DEX object model ──────────────────────────────────────────────────────────
 #
-# androguard 4.1.3's per-DEX objects (what a caller of DEX() gets and walks):
+# androguard 4.1.3's per-DEX objects (what DEX(), AnalyzeAPK's DEX list and
+# Analysis hand out):
 # DEX, ClassDefItem, EncodedMethod, EncodedField, EncodedValue, DalvikCode and
 # DCode, served one class_def at a time from androguard_rs.Apk (dex_class(),
 # code_instructions(), ...). Nothing per DEX is built up front: get_classes()
@@ -1060,12 +1055,13 @@ def _instructions(data) -> list:
 # single objects are.
 #
 # Unknown attributes raise AttributeError, as androguard's objects do (callers
-# may probe with getattr/try, e.g. `ClassDefItem.XREFfrom`); each is counted in
-# NOTES.
+# probing an attribute with try/except AttributeError, e.g. `XREFfrom` on a
+# ClassDefItem, see the same); each is counted in NOTES.
 
 from collections import OrderedDict  # noqa: E402
 import re as _re  # noqa: E402
 import threading as _threading  # noqa: E402
+import functools as _functools  # noqa: E402
 
 #: attribute -> times it was asked for and raised AttributeError, as in
 #: androguard (informational).
@@ -1124,11 +1120,16 @@ class _LRU:
         self._lock = _threading.Lock()
 
     def get(self, key, make):
-        with self._lock:
-            v = self._d.get(key)
-            if v is not None:
-                self._d.move_to_end(key)
-                return v
+        d = self._d
+        v = d.get(key)
+        if v is not None:
+            # A hit needs no lock: the lookup and move_to_end are each
+            # atomic; a key evicted in between just isn't moved.
+            try:
+                d.move_to_end(key)
+            except KeyError:
+                pass
+            return v
         v = make()
         with self._lock:
             v = self._d.setdefault(key, v)
@@ -1238,27 +1239,36 @@ _F_CLS, _F_NAME, _F_DESC, _F_FLAGS, _F_FSTR, _F_INIT, _F_IDX = range(7)
 
 
 def _information(proto: str, registers) -> dict:
-    """EncodedMethod.get_information(), verbatim from androguard 4.1.3, for a
-    method whose code has `registers` registers (None: no code)."""
-    info = dict()
-    if registers is not None:
-        nb = registers
-        ret = proto.split(')')
-        params = ret[0][1:].split()
+    """EncodedMethod.get_information(), as androguard 4.1.3 computes it, for a
+    method whose code has `registers` registers (None: no code): a new dict
+    (and "params" list) per call, from the parts computed once per
+    (descriptor, registers)."""
+    if registers is None:
+        return {}
+    ret, regs, params = _information_parts(proto, registers)
+    if params is None:
+        return {"return": ret, "registers": regs}
+    return {"return": ret, "registers": regs, "params": list(params)}
 
-        info["return"] = get_type(ret[1])
 
-        if params:
-            info["registers"] = (0, nb - len(params) - 1)
-            j = 0
-            info["params"] = []
-            for i in range(nb - len(params), nb):
-                info["params"].append((i, get_type(params[j])))
-                j += 1
-        else:
-            info["registers"] = (0, nb - 1)
+@_functools.lru_cache(maxsize=1 << 14)
+def _information_parts(proto: str, nb: int):
+    """(return type, registers, params tuple or None): androguard 4.1.3's
+    get_information() code, verbatim apart from building tuples."""
+    ret = proto.split(')')
+    params = ret[0][1:].split()
 
-    return info
+    ret_type = get_type(ret[1])
+
+    if params:
+        registers = (0, nb - len(params) - 1)
+        out = []
+        j = 0
+        for i in range(nb - len(params), nb):
+            out.append((i, get_type(params[j])))
+            j += 1
+        return ret_type, registers, tuple(out)
+    return ret_type, (0, nb - 1), None
 
 
 class EncodedMethod(_Quiet):
@@ -1596,7 +1606,7 @@ class DEX(_Quiet):
     raises (``ValueError("Not a DEX file, Header too small.")``, ``"This is
     not a DEX file! Wrong endian tag: ..."``, wrong magic, Adler-32
     checksum, header size, id counts; ``NotImplementedError`` for a
-    byte-swapped tag), so callers' error handling works unchanged; then checks
+    byte-swapped tag), so code catching them works unchanged; then checks
     the native reader can parse it (``ValueError`` otherwise). The bytes are
     kept until an ``androguard_rs.analysis.Analysis`` it was added to runs
     ``create_xref()``, which indexes every added DEX together and binds each
@@ -1604,28 +1614,30 @@ class DEX(_Quiet):
 
     ``AnalyzeAPK`` returns one per DEX file, bound to its index."""
 
-    __slots__ = ("_raw", "_rs", "_d", "CM", "api_version", "_classes", "_cache", "_insn_cache", "_analysis",
-                 "__weakref__")
+    __slots__ = ("_raw", "_rs", "_d", "CM", "api_version", "_classes", "_first_class", "_cache", "_insn_cache", "_analysis",
+                 "_ag_add", "_ag_xref", "__weakref__")
 
     _CLASS_CACHE = 512
     _INSN_CACHE = 256
 
     def __init__(self, buff, decompiler=None, config=None, using_api=None):
-        err = _native._dex_header_error(buff)
-        if err is not None:
-            raise (NotImplementedError if err[0] == "NotImplementedError" else ValueError)(err[1])
-        _native._dex_parse_check(buff)
+        load, add, xref = _native._dex_check(buff, _agerr.max_depth(_sys._getframe(0)), _agerr.c_units())
+        if load is not None:
+            raise _agerr.make(load)
         self._init(None, None)
+        self._ag_add, self._ag_xref = add, xref
         self._raw = buff
         self.api_version = using_api if using_api else 16
 
     def _init(self, rs, d):
         self._raw = None
+        self._ag_add = self._ag_xref = None
         self._rs = rs
         self._d = d
         self.CM = ClassManager(self)
         self.api_version = 16
         self._classes = None
+        self._first_class = None
         self._cache = _LRU(self._CLASS_CACHE)
         self._insn_cache = _LRU(self._INSN_CACHE)
         self._analysis = None
@@ -1643,6 +1655,7 @@ class DEX(_Quiet):
         bytes and anything cached from a private index."""
         self._rs, self._d, self._raw = rs, d, None
         self._classes = None
+        self._first_class = None
         self._cache = _LRU(self._CLASS_CACHE)
         self._insn_cache = _LRU(self._INSN_CACHE)
 
@@ -1681,7 +1694,7 @@ class DEX(_Quiet):
             data = self._native().code_instructions(self._d, code_off)
             if data is None:
                 return ([], [])
-            return (_instructions(data), [r[0] for r in data[1]])
+            return (_instructions(data), data[2])
 
         return self._insn_cache.get(code_off, make)
 
@@ -1711,6 +1724,17 @@ class DEX(_Quiet):
         return len(self.get_classes())
 
     def get_class(self, name: str):
+        # androguard: the first class_def named `name`, by a linear scan;
+        # here through a name -> first class_def dict, built once.
+        first = self._first_class
+        if first is None:
+            first = {}
+            for i in self.get_classes():
+                first.setdefault(i.get_name(), i)
+            self._first_class = first
+        return first.get(name) if isinstance(name, str) else self._get_class_scan(name)
+
+    def _get_class_scan(self, name):
         for i in self.get_classes():
             if i.get_name() == name:
                 return i
@@ -1759,20 +1783,6 @@ class DEX(_Quiet):
         key = class_name + field_name + descriptor
         hit = self._native().dex_find_member(self._d, key, True)
         return None if hit is None else self.get_classes()[hit[0]].get_fields()[hit[1]]
-
-    def get_ssl_candidate_methods(self) -> list:
-        """Not androguard: the EncodedMethods of get_encoded_methods(), in its
-        order, that may implement or weaken TLS certificate/hostname
-        validation (a cheap superset for callers that then run their own
-        per-method checks: a method named checkServerTrusted, verify or
-        onReceivedSslError, or whose code new-instances a type ending in
-        ``Lorg/apache/http/conn/ssl/AllowAllHostnameVerifier;``, sget-objects
-        a field containing ``...SSLSocketFactory;->ALLOW_ALL_HOSTNAME_VERIFIER``,
-        invoke-statics a method ending in ``...->getInsecure(I
-        Landroid/net/SSLSessionCache;)Ljavax/net/ssl/SSLSocketFactory;``, or
-        can't be read or disassembled)."""
-        classes = self.get_classes()
-        return [classes[ci].get_methods()[pos] for ci, pos in self._native().ssl_candidates(self._d)]
 
     def __repr__(self):
         return f"<androguard_rs.dex.DEX #{self._d}>"
