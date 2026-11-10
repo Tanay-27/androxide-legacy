@@ -21,6 +21,7 @@ use androguard_core::render::{AgResolver, INVALID_INSTRUCTION_TEMPLATE};
 mod apkinfo;
 mod handles;
 mod resources;
+mod strstats;
 
 // Same name as androguard's exception, so `str()`/`repr()` of what bytecode()
 // raises come out identical.
@@ -2130,6 +2131,7 @@ fn androguard_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_dex_first_invalid, m)?)?;
     m.add_function(wrap_pyfunction!(_py_lower, m)?)?;
     m.add_class::<resources::Resources>()?;
+    m.add_class::<strstats::StringStats>()?;
     m.add("ResourcesError", m.py().get_type::<resources::ResourcesError>())?;
     m.add_function(wrap_pyfunction!(resources::_decode_pool_string, m)?)?;
     m.add_function(wrap_pyfunction!(resources::_format_value, m)?)?;
